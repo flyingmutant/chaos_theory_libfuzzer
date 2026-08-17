@@ -17,10 +17,12 @@
 #include "FuzzerTracePC.h"
 #include "FuzzerUtil.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -110,6 +112,24 @@ struct GlobalEnv {
   size_t NumRuns = 0;
 
   std::string StopFile() { return DirPlusFile(TempDir, "STOP"); }
+
+  void SortFilesBySize() {
+    assert(Files.size() == FilesSizes.size());
+    std::vector<SizedFile> SizedFiles;
+    SizedFiles.reserve(Files.size());
+    for (size_t I = 0; I < Files.size(); ++I)
+      SizedFiles.push_back({Files[I], FilesSizes[I]});
+    std::stable_sort(SizedFiles.begin(), SizedFiles.end());
+
+    Files.clear();
+    FilesSizes.clear();
+    Files.reserve(SizedFiles.size());
+    FilesSizes.reserve(SizedFiles.size());
+    for (auto &File : SizedFiles) {
+      Files.push_back(std::move(File.File));
+      FilesSizes.push_back(File.Size);
+    }
+  }
 
   size_t secondsSinceProcessStartUp() const {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -229,18 +249,22 @@ struct GlobalEnv {
     if (MergeCandidates.empty()) return;
 
     std::vector<std::string> FilesToAdd;
+    std::vector<size_t> FilesToAddSizes;
     std::set<uint32_t> NewFeatures, NewCov;
     bool IsSetCoverMerge =
         !Job->Cmd.getFlagValue("set_cover_merge").compare("1");
     CrashResistantMerge(Args, {}, MergeCandidates, &FilesToAdd, Features,
                         &NewFeatures, Cov, &NewCov, Job->CFPath, false,
-                        IsSetCoverMerge);
-    for (auto &Path : FilesToAdd) {
+                        IsSetCoverMerge, &FilesToAddSizes);
+    assert(FilesToAdd.size() == FilesToAddSizes.size());
+    for (size_t I = 0; I < FilesToAdd.size(); ++I) {
+      auto &Path = FilesToAdd[I];
       auto U = FileToVector(Path);
       auto NewPath = DirPlusFile(MainCorpusDir, Hash(U));
       WriteToFile(U, NewPath);
       if (Group) { // Insert the queue according to the size of the seed.
-        size_t UnitSize = U.size();
+        size_t UnitSize = FilesToAddSizes[I];
+        assert(std::is_sorted(FilesSizes.begin(), FilesSizes.end()));
         auto Idx =
             std::upper_bound(FilesSizes.begin(), FilesSizes.end(), UnitSize) -
             FilesSizes.begin();
@@ -340,23 +364,39 @@ void FuzzWithFork(Random &Rand, const FuzzingOptions &Options,
     Env.MainCorpusDir = CorpusDirs[0];
 
   if (Options.KeepSeed) {
-    for (auto &File : SeedFiles)
+    std::map<std::string, size_t> EffectiveSizes;
+    if (Env.Group && EF->LLVMFuzzerCustomGetEffectiveInput) {
+      // -keep_seed bypasses merge selection, but grouping still needs the
+      // effective size of every seed. Use the merge scan only to measure it.
+      auto CFPath = DirPlusFile(Env.TempDir, "merge.txt");
+      std::vector<std::string> IgnoredFiles;
+      std::set<uint32_t> IgnoredFeatures, IgnoredCov;
+      CrashResistantMerge(Env.Args, {}, SeedFiles, &IgnoredFiles, {},
+                          &IgnoredFeatures, {}, &IgnoredCov, CFPath,
+                          /*Verbose=*/false, /*IsSetCoverMerge=*/false,
+                          /*NewFileSizes=*/nullptr, &EffectiveSizes);
+      RemoveFile(CFPath);
+    }
+    for (auto &File : SeedFiles) {
       Env.Files.push_back(File.File);
+      auto It = EffectiveSizes.find(File.File);
+      Env.FilesSizes.push_back(It == EffectiveSizes.end() ? File.Size
+                                                          : It->second);
+    }
   } else {
     auto CFPath = DirPlusFile(Env.TempDir, "merge.txt");
     std::set<uint32_t> NewFeatures, NewCov;
     CrashResistantMerge(Env.Args, {}, SeedFiles, &Env.Files, Env.Features,
                         &NewFeatures, Env.Cov, &NewCov, CFPath,
-                        /*Verbose=*/false, /*IsSetCoverMerge=*/false);
+                        /*Verbose=*/false, /*IsSetCoverMerge=*/false,
+                        &Env.FilesSizes);
     Env.Features.insert(NewFeatures.begin(), NewFeatures.end());
     Env.Cov.insert(NewCov.begin(), NewCov.end());
     RemoveFile(CFPath);
   }
 
-  if (Env.Group) {
-    for (auto &path : Env.Files)
-      Env.FilesSizes.push_back(FileSize(path));
-  }
+  if (Env.Group)
+    Env.SortFilesBySize();
 
   Printf("INFO: -fork=%d: %zd seed inputs, starting to fuzz in %s\n", NumJobs,
          Env.Files.size(), Env.TempDir.c_str());
@@ -410,9 +450,9 @@ void FuzzWithFork(Random &Rand, const FuzzingOptions &Options,
       Env.FilesSizes.clear();
       CrashResistantMerge(Env.Args, {}, CurrentSeedFiles, &Env.Files,
                           TmpFeatures, &TmpNewFeatures, TmpCov, &TmpNewCov,
-                          CFPath, /*Verbose=*/false, /*IsSetCoverMerge=*/false);
-      for (auto &path : Env.Files)
-        Env.FilesSizes.push_back(FileSize(path));
+                          CFPath, /*Verbose=*/false, /*IsSetCoverMerge=*/false,
+                          &Env.FilesSizes);
+      Env.SortFilesBySize();
       RemoveFile(CFPath);
       JobExecuted = 0;
       MergeCycle += 5;

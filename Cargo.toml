@@ -37,6 +37,7 @@ members = [
   "./example_crossover/fuzz",
   "./example_init/fuzz",
   "./example_mutator/fuzz",
+  "./example_effective_input/fuzz",
 ]
 
 [dev-dependencies]

@@ -332,10 +332,11 @@ int RunOneTest(Fuzzer *F, const char *InputFilePath, size_t MaxLen) {
   Unit U = FileToVector(InputFilePath);
   if (MaxLen && MaxLen < U.size())
     U.resize(MaxLen);
-  F->ExecuteCallback(U.data(), U.size());
+  bool Accepted = F->ExecuteCallback(U.data(), U.size());
   if (Flags.print_full_coverage) {
     // Leak detection is not needed when collecting full coverage data.
-    F->TPCUpdateObservedPCs();
+    if (Accepted || !EF->LLVMFuzzerCustomGetEffectiveInput)
+      F->TPCUpdateObservedPCs();
   } else {
     F->TryDetectingAMemoryLeak(U.data(), U.size(), true);
   }
@@ -507,7 +508,15 @@ int MinimizeCrashInputInternalStep(Fuzzer *F, InputCorpus *Corpus) {
     Printf("INFO: The input is small enough, exiting\n");
     exit(0);
   }
-  F->SetMaxInputLen(U.size());
+  size_t MaxInputLen = U.size();
+  if (EF->LLVMFuzzerCustomGetEffectiveInput) {
+    // Raw mutations stay capped below at U.size() - 1, but the effective-input
+    // callback needs independent output capacity.
+    const size_t EffectiveInputCapacity =
+        Flags.max_len ? static_cast<size_t>(Flags.max_len) : size_t(1 << 20);
+    MaxInputLen = Max(MaxInputLen, EffectiveInputCapacity);
+  }
+  F->SetMaxInputLen(MaxInputLen);
   F->SetMaxMutationLen(U.size() - 1);
   F->MinimizeCrashLoop(U);
   Printf("INFO: Done MinimizeCrashInputInternalStep, no crashes found\n");
@@ -534,8 +543,22 @@ void Merge(Fuzzer *F, FuzzingOptions &Options,
   std::set<uint32_t> NewFeatures, NewCov;
   CrashResistantMerge(Args, OldCorpus, NewCorpus, &NewFiles, {}, &NewFeatures,
                       {}, &NewCov, CFPath, true, Flags.set_cover_merge);
-  for (auto &Path : NewFiles)
-    F->WriteToOutputCorpus(FileToVector(Path, Options.MaxLen));
+  if (!EF->LLVMFuzzerCustomGetEffectiveInput) {
+    for (auto &Path : NewFiles)
+      F->WriteToOutputCorpus(FileToVector(Path, Options.MaxLen));
+  } else {
+    const size_t MergeMaxLen = Options.MaxLen ? Options.MaxLen : size_t(1 << 20);
+    if (Options.MaxLen == 0)
+      F->SetMaxInputLen(MergeMaxLen);
+    for (auto &Path : NewFiles) {
+      Unit U = FileToVector(Path, MergeMaxLen);
+      if (!F->ExecuteCallback(U.data(), U.size()))
+        continue;
+      const uint8_t *EffectiveData;
+      size_t EffectiveSize = F->GetLastEffectiveUnit(&EffectiveData);
+      F->WriteToOutputCorpus({EffectiveData, EffectiveData + EffectiveSize});
+    }
+  }
   // We are done, delete the control file if it was a temporary one.
   if (!Flags.merge_control_file)
     RemoveFile(CFPath);
@@ -556,7 +579,9 @@ int AnalyzeDictionary(Fuzzer *F, const std::vector<Unit> &Dict,
   std::vector<size_t> ModifiedFeatures;
   for (auto &C : Corpus) {
     // Get coverage for the testcase without modifications.
-    F->ExecuteCallback(C.data(), C.size());
+    bool Accepted = F->ExecuteCallback(C.data(), C.size());
+    if (!Accepted && EF->LLVMFuzzerCustomGetEffectiveInput)
+      continue;
     InitialFeatures.clear();
     TPC.CollectFeatures([&](size_t Feature) {
       InitialFeatures.push_back(Feature);
@@ -582,7 +607,13 @@ int AnalyzeDictionary(Fuzzer *F, const std::vector<Unit> &Dict,
       }
 
       // Get coverage for testcase with masked occurrences of dictionary unit.
-      F->ExecuteCallback(Data.data(), Data.size());
+      Accepted = F->ExecuteCallback(Data.data(), Data.size());
+      if (!Accepted && EF->LLVMFuzzerCustomGetEffectiveInput) {
+        // A token whose removal makes the input inadmissible is conservatively
+        // useful; rejected coverage maps must not participate in comparison.
+        Scores[i] += 2;
+        continue;
+      }
       ModifiedFeatures.clear();
       TPC.CollectFeatures([&](size_t Feature) {
         ModifiedFeatures.push_back(Feature);
@@ -654,6 +685,14 @@ int FuzzerDriver(int *argc, char ***argv, UserCallback Callback) {
   assert(argc && argv && "Argument pointers cannot be nullptr");
   std::string Argv0((*argv)[0]);
   EF = new ExternalFunctions();
+  if (EF->LLVMFuzzerRequireEffectiveInput) {
+    if (!EF->LLVMFuzzerCustomGetEffectiveInput) {
+      Printf("ERROR: LLVMFuzzerRequireEffectiveInput is defined, but "
+             "LLVMFuzzerCustomGetEffectiveInput is missing.\n");
+      return 1;
+    }
+    EF->LLVMFuzzerRequireEffectiveInput();
+  }
   if (EF->LLVMFuzzerInitialize)
     EF->LLVMFuzzerInitialize(argc, argv);
   if (EF->__msan_scoped_disable_interceptor_checks)
@@ -669,6 +708,19 @@ int FuzzerDriver(int *argc, char ***argv, UserCallback Callback) {
   if (Flags.help) {
     PrintHelp();
     return 0;
+  }
+
+  if (EF->LLVMFuzzerCustomGetEffectiveInput && Flags.data_flow_trace) {
+    Printf("ERROR: an effective-input callback is incompatible with "
+           "-data_flow_trace because the effective input may change "
+           "positional trace keys.\n");
+    return 1;
+  }
+  if (EF->LLVMFuzzerCustomGetEffectiveInput && Flags.collect_data_flow) {
+    Printf("ERROR: an effective-input callback is incompatible with "
+           "-collect_data_flow because the effective input may change "
+           "positional trace keys.\n");
+    return 1;
   }
 
   if (Flags.close_fd_mask & 2)
@@ -861,6 +913,12 @@ int FuzzerDriver(int *argc, char ***argv, UserCallback Callback) {
 
   if (RunIndividualFiles) {
     Options.SaveArtifacts = false;
+    if (EF->LLVMFuzzerCustomGetEffectiveInput && Options.MaxLen == 0) {
+      size_t MaxStandaloneInputSize = 4096;
+      for (const auto &Path : *Inputs)
+        MaxStandaloneInputSize = Max(MaxStandaloneInputSize, FileSize(Path));
+      F->SetMaxInputLen(MaxStandaloneInputSize);
+    }
     int Runs = std::max(1, Flags.runs);
     Printf("%s: Running %zd inputs %d time(s) each.\n", ProgName->c_str(),
            Inputs->size(), Runs);
@@ -900,6 +958,8 @@ int FuzzerDriver(int *argc, char ***argv, UserCallback Callback) {
 
   if (Flags.analyze_dict) {
     size_t MaxLen = INT_MAX;  // Large max length.
+    if (EF->LLVMFuzzerCustomGetEffectiveInput && Options.MaxLen)
+      MaxLen = Options.MaxLen;
     UnitVector InitialCorpus;
     for (auto &Inp : *Inputs) {
       Printf("Loading corpus dir: %s\n", Inp.c_str());
@@ -910,6 +970,25 @@ int FuzzerDriver(int *argc, char ***argv, UserCallback Callback) {
     if (Dictionary.empty() || Inputs->empty()) {
       Printf("ERROR: can't analyze dict without dict and corpus provided\n");
       return 1;
+    }
+    if (EF->LLVMFuzzerCustomGetEffectiveInput && Options.MaxLen == 0) {
+      size_t MaxAnalyzeInputSize = 4096;
+      for (const auto &U : InitialCorpus)
+        MaxAnalyzeInputSize = Max(MaxAnalyzeInputSize, U.size());
+      F->SetMaxInputLen(MaxAnalyzeInputSize);
+    }
+    // Dictionary analysis searches and edits corpus bytes directly.
+    if (EF->LLVMFuzzerCustomGetEffectiveInput) {
+      UnitVector EffectiveCorpus;
+      for (const auto &U : InitialCorpus) {
+        if (!F->ExecuteCallback(U.data(), U.size()))
+          continue;
+        const uint8_t *EffectiveData;
+        size_t EffectiveSize = F->GetLastEffectiveUnit(&EffectiveData);
+        EffectiveCorpus.emplace_back(EffectiveData,
+                                     EffectiveData + EffectiveSize);
+      }
+      InitialCorpus.swap(EffectiveCorpus);
     }
     if (AnalyzeDictionary(F, Dictionary, InitialCorpus)) {
       Printf("Dictionary analysis failed\n");

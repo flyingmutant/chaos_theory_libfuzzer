@@ -65,12 +65,13 @@ public:
   static void StaticGracefulExitCallback();
 
   // Executes the target callback on {Data, Size} once.
-  // Returns false if the input was rejected by the target (target returned -1),
-  // and true otherwise.
+  // Returns false if the input was rejected by the target (target returned -1)
+  // or its effective input does not fit, and true otherwise.
   bool ExecuteCallback(const uint8_t *Data, size_t Size);
   bool RunOne(const uint8_t *Data, size_t Size, bool MayDeleteFile = false,
               InputInfo *II = nullptr, bool ForceAddToCorpus = false,
-              bool *FoundUniqFeatures = nullptr);
+              bool *FoundUniqFeatures = nullptr,
+              bool PreferSmallFeatures = false);
   void TPCUpdateObservedPCs();
 
   // Merge Corpora[1:] into Corpora[0].
@@ -85,6 +86,7 @@ public:
 
   bool InFuzzingThread() const { return IsMyThread; }
   size_t GetCurrentUnitInFuzzingThead(const uint8_t **Data) const;
+  size_t GetLastEffectiveUnit(const uint8_t **Data) const;
   void TryDetectingAMemoryLeak(const uint8_t *Data, size_t Size,
                                bool DuringInitialCorpusExecution);
 
@@ -115,7 +117,12 @@ private:
 
   void AllocateCurrentUnitData();
   uint8_t *CurrentUnitData = nullptr;
+  uint8_t *EffectiveUnitData = nullptr;
   std::atomic<size_t> CurrentUnitSize;
+  // Size of the effective input produced by the last callback; zero after
+  // rejection or a successful empty input. With an effective-input callback,
+  // the effective bytes are left in CurrentUnitData.
+  size_t EffectiveUnitSize = 0;
   uint8_t BaseSha1[kSHA1NumBytes];  // Checksum of the base unit.
 
   bool GracefulExitRequested = false;
@@ -127,6 +134,10 @@ private:
 
   bool HasMoreMallocsThanFrees = false;
   size_t NumberOfLeakDetectionAttempts = 0;
+  Unit RawInputForLeakDetection;
+  bool HasRawInputForLeakDetection = false;
+  bool RunningLeakDetectionReplay = false;
+  bool PrintedEffectiveInputSizeWarning = false;
 
   system_clock::time_point LastAllocatorPurgeAttemptTime = system_clock::now();
 

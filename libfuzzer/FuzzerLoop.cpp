@@ -164,6 +164,8 @@ void Fuzzer::AllocateCurrentUnitData() {
   if (CurrentUnitData || MaxInputLen == 0)
     return;
   CurrentUnitData = new uint8_t[MaxInputLen];
+  if (EF->LLVMFuzzerCustomGetEffectiveInput)
+    EffectiveUnitData = new uint8_t[MaxInputLen];
 }
 
 void Fuzzer::StaticDeathCallback() {
@@ -373,8 +375,17 @@ void Fuzzer::PrintFinalStats() {
 }
 
 void Fuzzer::SetMaxInputLen(size_t MaxInputLen) {
-  assert(this->MaxInputLen == 0); // Can only reset MaxInputLen from 0 to non-0.
+  const bool IsInferredInitialization = this->MaxInputLen == 0;
+  assert(IsInferredInitialization); // Can only reset from 0 to non-0.
   assert(MaxInputLen);
+  // Use spare default capacity for a raw input's effective form to grow.
+  constexpr size_t kMaxDefaultInputLen = 1 << 20;
+  if (IsInferredInitialization && EF->LLVMFuzzerCustomGetEffectiveInput &&
+      MaxInputLen < kMaxDefaultInputLen) {
+    constexpr size_t kEffectiveInputHeadroom = 4096;
+    MaxInputLen += Min(kEffectiveInputHeadroom,
+                       kMaxDefaultInputLen - MaxInputLen);
+  }
   this->MaxInputLen = MaxInputLen;
   this->MaxMutationLen = MaxInputLen;
   AllocateCurrentUnitData();
@@ -507,20 +518,51 @@ static void WriteEdgeToMutationGraphFile(const std::string &MutationGraphFile,
 
 bool Fuzzer::RunOne(const uint8_t *Data, size_t Size, bool MayDeleteFile,
                     InputInfo *II, bool ForceAddToCorpus,
-                    bool *FoundUniqFeatures) {
-  if (!Size)
+                    bool *FoundUniqFeatures, bool PreferSmallFeatures) {
+  if (!Size && !EF->LLVMFuzzerCustomGetEffectiveInput) {
+    EffectiveUnitSize = 0;
     return false;
+  }
   // Largest input length should be INT_MAX.
   assert(Size < std::numeric_limits<uint32_t>::max());
 
-  if(!ExecuteCallback(Data, Size)) return false;
+  if (!ExecuteCallback(Data, Size)) return false;
+  if (EF->LLVMFuzzerCustomGetEffectiveInput) {
+    assert(CurrentUnitData);
+    Data = CurrentUnitData;
+    Size = EffectiveUnitSize;
+  }
+  if (!Size)
+    return false;
   auto TimeOfUnit = duration_cast<microseconds>(UnitStopTime - UnitStartTime);
+
+  bool EffectiveDuplicateChecked = false;
+  bool IsEffectiveDuplicate = false;
+  auto CheckEffectiveDuplicate = [&]() {
+    assert(EF->LLVMFuzzerCustomGetEffectiveInput);
+    if (!EffectiveDuplicateChecked) {
+      EffectiveDuplicateChecked = true;
+      IsEffectiveDuplicate = Corpus.HasUnit(Data, Size);
+    }
+    return IsEffectiveDuplicate;
+  };
 
   UniqFeatureSetTmp.clear();
   size_t FoundUniqFeaturesOfII = 0;
   size_t NumUpdatesBefore = Corpus.NumFeatureUpdates();
+  const bool ShrinkFeatures = Options.Shrink || PreferSmallFeatures;
   TPC.CollectFeatures([&](uint32_t Feature) {
-    if (Corpus.AddFeature(Feature, static_cast<uint32_t>(Size), Options.Shrink))
+    // An effective-input duplicate has no new corpus slot to own features. Defer
+    // the SHA-1 lookup until immediately before the first ownership change;
+    // most executions discover nothing and therefore do not need a hash.
+    bool MayAddFeature =
+        Corpus.WouldAddFeature(Feature, static_cast<uint32_t>(Size),
+                               ShrinkFeatures);
+    if (MayAddFeature && EF->LLVMFuzzerCustomGetEffectiveInput &&
+        CheckEffectiveDuplicate())
+      MayAddFeature = false;
+    if (MayAddFeature &&
+        Corpus.AddFeature(Feature, static_cast<uint32_t>(Size), ShrinkFeatures))
       UniqFeatureSetTmp.push_back(Feature);
     if (Options.Entropic)
       Corpus.UpdateFeatureFrequency(II, Feature);
@@ -532,8 +574,12 @@ bool Fuzzer::RunOne(const uint8_t *Data, size_t Size, bool MayDeleteFile,
   if (FoundUniqFeatures)
     *FoundUniqFeatures = FoundUniqFeaturesOfII;
   PrintPulseAndReportSlowInput(Data, Size);
+  if (IsEffectiveDuplicate)
+    return false;
   size_t NumNewFeatures = Corpus.NumFeatureUpdates() - NumUpdatesBefore;
   if (NumNewFeatures || ForceAddToCorpus) {
+    if (EF->LLVMFuzzerCustomGetEffectiveInput && CheckEffectiveDuplicate())
+      return false;
     TPC.UpdateObservedPCs();
     auto NewII =
         Corpus.AddToCorpus({Data, Data + Size}, NumNewFeatures, MayDeleteFile,
@@ -549,6 +595,8 @@ bool Fuzzer::RunOne(const uint8_t *Data, size_t Size, bool MayDeleteFile,
       II->DataFlowTraceForFocusFunction.empty() &&
       FoundUniqFeaturesOfII == II->UniqFeatureSet.size() &&
       II->U.size() > Size) {
+    if (EF->LLVMFuzzerCustomGetEffectiveInput && CheckEffectiveDuplicate())
+      return false;
     auto OldFeaturesFile = Sha1ToString(II->Sha1);
     Corpus.Replace(II, {Data, Data + Size}, TimeOfUnit);
     RenameFeatureSetFile(Options.FeaturesDir, OldFeaturesFile,
@@ -564,6 +612,12 @@ size_t Fuzzer::GetCurrentUnitInFuzzingThead(const uint8_t **Data) const {
   assert(InFuzzingThread());
   *Data = CurrentUnitData;
   return CurrentUnitSize;
+}
+
+size_t Fuzzer::GetLastEffectiveUnit(const uint8_t **Data) const {
+  assert(InFuzzingThread());
+  *Data = CurrentUnitData;
+  return EffectiveUnitSize;
 }
 
 void Fuzzer::CrashOnOverwrittenData() {
@@ -596,20 +650,33 @@ ATTRIBUTE_NOINLINE bool Fuzzer::ExecuteCallback(const uint8_t *Data,
   TPC.RecordInitialStack();
   TotalNumberOfRuns++;
   assert(InFuzzingThread());
+  assert(!EF->LLVMFuzzerCustomGetEffectiveInput || CurrentUnitData);
+  assert(!EF->LLVMFuzzerCustomGetEffectiveInput || Size <= MaxInputLen);
   // We copy the contents of Unit into a separate heap buffer
   // so that we reliably find buffer overflows in it.
   uint8_t *DataCopy = new uint8_t[Size];
   // memcpy cannot take null pointer arguments even if Size is 0.
   if (Size)
     memcpy(DataCopy, Data, Size);
+  if (HasRawInputForLeakDetection) {
+    RawInputForLeakDetection.clear();
+    HasRawInputForLeakDetection = false;
+  }
   if (EF->__msan_unpoison)
     EF->__msan_unpoison(DataCopy, Size);
   if (EF->__msan_unpoison_param)
     EF->__msan_unpoison_param(2);
-  if (CurrentUnitData && CurrentUnitData != Data)
+  if (Size && CurrentUnitData && CurrentUnitData != Data)
     memcpy(CurrentUnitData, Data, Size);
   CurrentUnitSize = Size;
+  EffectiveUnitSize = 0;
   int CBRes = 0;
+  size_t ProvidedEffectiveSize = 0;
+  auto CheckInputNotOverwritten = [&]() {
+    ScopedDisableMsanInterceptorChecks S;
+    if (Size && !LooseMemeq(DataCopy, Data, Size))
+      CrashOnOverwrittenData();
+  };
   {
     ScopedEnableMsanInterceptorChecks S;
     AllocTracer.Start(Options.TraceMalloc);
@@ -617,14 +684,62 @@ ATTRIBUTE_NOINLINE bool Fuzzer::ExecuteCallback(const uint8_t *Data,
     TPC.ResetMaps();
     RunningUserCallback = true;
     CBRes = CB(DataCopy, Size);
+    assert(CBRes == 0 || CBRes == -1);
+    CheckInputNotOverwritten();
+    if (CBRes == 0) {
+      EffectiveUnitSize = Size;
+      if (EF->LLVMFuzzerCustomGetEffectiveInput) {
+        assert(EffectiveUnitData && "MaxInputLen is not initialized");
+        if (EF->__msan_unpoison_param)
+          EF->__msan_unpoison_param(4);
+        ProvidedEffectiveSize = EF->LLVMFuzzerCustomGetEffectiveInput(
+            DataCopy, Size, EffectiveUnitData, MaxInputLen);
+        CheckInputNotOverwritten();
+        if (ProvidedEffectiveSize > MaxInputLen) {
+          if (!PrintedEffectiveInputSizeWarning) {
+            PrintedEffectiveInputSizeWarning = true;
+            Printf("WARNING: LLVMFuzzerCustomGetEffectiveInput returned %zd "
+                   "bytes, exceeding MaxOutSize %zd; rejecting this input. "
+                   "Increase -max_len to admit effective inputs of this "
+                   "size.\n",
+                   ProvidedEffectiveSize, MaxInputLen);
+          }
+          CBRes = -1;
+          EffectiveUnitSize = 0;
+          ProvidedEffectiveSize = 0;
+        }
+        const uint8_t *EffectiveData =
+            ProvidedEffectiveSize ? EffectiveUnitData : DataCopy;
+        size_t EffectiveSize =
+            ProvidedEffectiveSize ? ProvidedEffectiveSize : Size;
+        if (CBRes == 0 && Options.OnlyASCII &&
+            !IsASCII(EffectiveData, EffectiveSize)) {
+          Printf("==%d== ERROR: libFuzzer: effective-input callback produced "
+                 "non-ASCII output with -only_ascii=1\n",
+                 (int)GetPid());
+          DumpCurrentUnit("effective-input-");
+          PrintFinalStats();
+          _Exit(Options.ErrorExitCode);
+        }
+      }
+    }
     RunningUserCallback = false;
     UnitStopTime = system_clock::now();
-    assert(CBRes == 0 || CBRes == -1);
     HasMoreMallocsThanFrees = AllocTracer.Stop();
   }
-  if (!LooseMemeq(DataCopy, Data, Size))
-    CrashOnOverwrittenData();
   CurrentUnitSize = 0;
+  if (CBRes == 0 && ProvidedEffectiveSize) {
+    memcpy(CurrentUnitData, EffectiveUnitData, ProvidedEffectiveSize);
+    EffectiveUnitSize = ProvidedEffectiveSize;
+  }
+  // Leak confirmation must replay the complete target and effective-input
+  // callback transaction. Preserve raw bytes only on the already-slow
+  // suspicion path.
+  if (EF->LLVMFuzzerCustomGetEffectiveInput && Options.DetectLeaks &&
+      HasMoreMallocsThanFrees && !RunningLeakDetectionReplay) {
+    RawInputForLeakDetection.assign(DataCopy, DataCopy + Size);
+    HasRawInputForLeakDetection = true;
+  }
   delete[] DataCopy;
   return CBRes == 0;
 }
@@ -689,10 +804,20 @@ void Fuzzer::TryDetectingAMemoryLeak(const uint8_t *Data, size_t Size,
   if (!&(EF->__lsan_enable) || !&(EF->__lsan_disable) ||
       !(EF->__lsan_do_recoverable_leak_check))
     return; // No lsan.
+  Unit RawInput;
+  const bool ReplayingRawInput = HasRawInputForLeakDetection;
+  if (ReplayingRawInput) {
+    RawInput.swap(RawInputForLeakDetection);
+    HasRawInputForLeakDetection = false;
+    Data = RawInput.data();
+    Size = RawInput.size();
+  }
   // Run the target once again, but with lsan disabled so that if there is
   // a real leak we do not report it twice.
   EF->__lsan_disable();
-  ExecuteCallback(Data, Size);
+  RunningLeakDetectionReplay = true;
+  bool Accepted = ExecuteCallback(Data, Size);
+  RunningLeakDetectionReplay = false;
   EF->__lsan_enable();
   if (!HasMoreMallocsThanFrees)
     return; // a leak is unlikely.
@@ -713,7 +838,16 @@ void Fuzzer::TryDetectingAMemoryLeak(const uint8_t *Data, size_t Size,
     if (DuringInitialCorpusExecution)
       Printf("\nINFO: a leak has been found in the initial corpus.\n\n");
     Printf("INFO: to ignore leaks on libFuzzer side use -detect_leaks=0.\n\n");
-    CurrentUnitSize = Size;
+    if (ReplayingRawInput) {
+      assert(CurrentUnitData);
+      if (Size)
+        memcpy(CurrentUnitData, RawInput.data(), Size);
+      CurrentUnitSize = Size;
+    } else {
+      CurrentUnitSize = Accepted && EF->LLVMFuzzerCustomGetEffectiveInput
+                            ? EffectiveUnitSize
+                            : Size;
+    }
     DumpCurrentUnit("leak-");
     PrintFinalStats();
     _Exit(Options.ErrorExitCode); // not exit() to disable lsan further on.
@@ -764,8 +898,18 @@ void Fuzzer::MutateAndTestOne() {
     bool FoundUniqFeatures = false;
     bool NewCov = RunOne(CurrentUnitData, Size, /*MayDeleteFile=*/true, &II,
                          /*ForceAddToCorpus*/ false, &FoundUniqFeatures);
+    if (EffectiveUnitSize) {
+      Size = EffectiveUnitSize;
+      CurrentMaxMutationLen =
+          Min(MaxMutationLen, Max(CurrentMaxMutationLen, Size));
+    }
     TryDetectingAMemoryLeak(CurrentUnitData, Size,
                             /*DuringInitialCorpusExecution*/ false);
+    if (EffectiveUnitSize) {
+      Size = EffectiveUnitSize;
+      CurrentMaxMutationLen =
+          Min(MaxMutationLen, Max(CurrentMaxMutationLen, Size));
+    }
     if (NewCov) {
       ReportNewCoverage(&II, {CurrentUnitData, CurrentUnitData + Size});
       break;  // We will mutate this input more in the next rounds.
@@ -807,14 +951,28 @@ void Fuzzer::ReadAndExecuteSeedCorpora(std::vector<SizedFile> &CorporaFiles) {
     SetMaxInputLen(std::clamp(MaxSize, kMinDefaultLen, kMaxSaneLen));
   assert(MaxInputLen > 0);
 
+  Unit FallbackUnit({'\n'}); // Valid ASCII input.
+  auto RememberEffectiveUnit = [&]() {
+    if (EF->LLVMFuzzerCustomGetEffectiveInput && EffectiveUnitSize)
+      FallbackUnit.assign(CurrentUnitData, CurrentUnitData + EffectiveUnitSize);
+  };
+
   // Test the callback with empty input and never try it again.
   uint8_t dummy = 0;
-  ExecuteCallback(&dummy, 0);
+  if (EF->LLVMFuzzerCustomGetEffectiveInput) {
+    RunOne(&dummy, 0);
+    RememberEffectiveUnit();
+    TryDetectingAMemoryLeak(&dummy, 0,
+                            /*DuringInitialCorpusExecution*/ true);
+  } else {
+    ExecuteCallback(&dummy, 0);
+  }
 
   if (CorporaFiles.empty()) {
     Printf("INFO: A corpus is not provided, starting from an empty corpus\n");
     Unit U({'\n'}); // Valid ASCII input.
     RunOne(U.data(), U.size());
+    RememberEffectiveUnit();
   } else {
     Printf("INFO: seed corpus: files: %zd min: %zdb max: %zdb total: %zdb"
            " rss: %zdMb\n",
@@ -833,7 +991,10 @@ void Fuzzer::ReadAndExecuteSeedCorpora(std::vector<SizedFile> &CorporaFiles) {
       assert(U.size() <= MaxInputLen);
       RunOne(U.data(), U.size(), /*MayDeleteFile*/ false, /*II*/ nullptr,
              /*ForceAddToCorpus*/ Options.KeepSeed,
-             /*FoundUniqFeatures*/ nullptr);
+             /*FoundUniqFeatures*/ nullptr,
+             /*PreferSmallFeatures*/
+             Options.PreferSmall && EF->LLVMFuzzerCustomGetEffectiveInput);
+      RememberEffectiveUnit();
       CheckExitOnSrcPosOrItem();
       TryDetectingAMemoryLeak(U.data(), U.size(),
                               /*DuringInitialCorpusExecution*/ true);
@@ -856,8 +1017,9 @@ void Fuzzer::ReadAndExecuteSeedCorpora(std::vector<SizedFile> &CorporaFiles) {
            "This may also happen if the target rejected all inputs we tried so "
            "far\n");
     // The remaining logic requires that the corpus is not empty,
-    // so we add one fake input to the in-memory corpus.
-    Corpus.AddToCorpus({'\n'}, /*NumFeatures=*/1, /*MayDeleteFile=*/true,
+    // so we add one fake input to the in-memory corpus. If startup produced an
+    // accepted effective unit, continue mutation from those bytes.
+    Corpus.AddToCorpus(FallbackUnit, /*NumFeatures=*/1, /*MayDeleteFile=*/true,
                        /*HasFocusFunction=*/false, /*NeverReduce=*/false,
                        /*TimeOfUnit=*/duration_cast<microseconds>(0s), {0}, DFT,
                        /*BaseII*/ nullptr);
@@ -922,13 +1084,29 @@ void Fuzzer::MinimizeCrashLoop(const Unit &U) {
   while (!TimedOut() && TotalNumberOfRuns < Options.MaxNumberOfRuns) {
     MD.StartMutationSequence();
     memcpy(CurrentUnitData, U.data(), U.size());
+    size_t Size = U.size();
     for (int i = 0; i < Options.MutateDepth; i++) {
-      size_t NewSize = MD.Mutate(CurrentUnitData, U.size(), MaxMutationLen);
+      size_t MutationInputSize = EF->LLVMFuzzerCustomGetEffectiveInput
+                                     ? Size
+                                     : U.size();
+      size_t NewSize =
+          MD.Mutate(CurrentUnitData, MutationInputSize, MaxMutationLen);
       assert(NewSize > 0 && NewSize <= MaxMutationLen);
-      ExecuteCallback(CurrentUnitData, NewSize);
-      PrintPulseAndReportSlowInput(CurrentUnitData, NewSize);
-      TryDetectingAMemoryLeak(CurrentUnitData, NewSize,
+      bool Accepted = ExecuteCallback(CurrentUnitData, NewSize);
+      if (!EF->LLVMFuzzerCustomGetEffectiveInput) {
+        PrintPulseAndReportSlowInput(CurrentUnitData, NewSize);
+        TryDetectingAMemoryLeak(CurrentUnitData, NewSize,
+                                /*DuringInitialCorpusExecution*/ false);
+        continue;
+      }
+      Size = Accepted ? EffectiveUnitSize : NewSize;
+      PrintPulseAndReportSlowInput(CurrentUnitData, Size);
+      TryDetectingAMemoryLeak(CurrentUnitData, Size,
                               /*DuringInitialCorpusExecution*/ false);
+      if (EffectiveUnitSize)
+        Size = EffectiveUnitSize;
+      if (Size > MaxMutationLen)
+        break;
     }
   }
 }

@@ -298,7 +298,12 @@ public:
     DistributionNeedsUpdate = true;
   }
 
-  bool HasUnit(const Unit &U) { return Hashes.count(Hash(U)); }
+  bool HasUnit(const uint8_t *Data, size_t Size) {
+    uint8_t Sha1[kSHA1NumBytes];
+    ComputeSHA1(Data, Size, Sha1);
+    return Hashes.count(Sha1ToString(Sha1));
+  }
+  bool HasUnit(const Unit &U) { return HasUnit(U.data(), U.size()); }
   bool HasUnit(const std::string &H) { return Hashes.count(H); }
   InputInfo &ChooseUnitToMutate(Random &Rand) {
     InputInfo &II = *Inputs[ChooseUnitIdxToMutate(Rand)];
@@ -416,17 +421,23 @@ public:
     DistributionNeedsUpdate = true;
   }
 
-  bool AddFeature(size_t Idx, uint32_t NewSize, bool Shrink) {
+  bool WouldAddFeature(size_t Idx, uint32_t NewSize, bool Shrink) const {
     assert(NewSize);
     Idx = Idx % kFeatureSetSize;
     uint32_t OldSize = GetFeature(Idx);
-    if (OldSize == 0 || (Shrink && OldSize > NewSize)) {
+    return OldSize == 0 || (Shrink && OldSize > NewSize);
+  }
+
+  bool AddFeature(size_t Idx, uint32_t NewSize, bool Shrink) {
+    if (WouldAddFeature(Idx, NewSize, Shrink)) {
+      Idx = Idx % kFeatureSetSize;
+      uint32_t OldSize = GetFeature(Idx);
       if (OldSize > 0) {
         size_t OldIdx = SmallestElementPerFeature[Idx];
         InputInfo &II = *Inputs[OldIdx];
         assert(II.NumFeatures > 0);
         II.NumFeatures--;
-        if (II.NumFeatures == 0)
+        if (II.NumFeatures == 0 && !II.NeverReduce)
           DeleteInput(OldIdx);
       } else {
         NumAddedFeatures++;

@@ -69,6 +69,8 @@ struct MemMemTable {
 
 class TracePC {
  public:
+  struct PCTableEntry;
+
   void HandleInline8bitCountersInit(uint8_t *Start, uint8_t *Stop);
   void HandlePCsInit(const uintptr_t *Start, const uintptr_t *Stop);
   void HandleCallerCallee(uintptr_t Caller, uintptr_t Callee);
@@ -78,7 +80,8 @@ class TracePC {
   void SetUseValueProfileMask(uint32_t VPMask) { UseValueProfileMask = VPMask; }
   void SetPrintNewPCs(bool P) { DoPrintNewPCs = P; }
   void SetPrintNewFuncs(size_t P) { NumPrintNewFuncs = P; }
-  void UpdateObservedPCs();
+  void UpdateObservedPCs(
+      std::vector<const PCTableEntry *> *CurrentPCs = nullptr);
   template <class Callback> size_t CollectFeatures(Callback CB) const;
 
   void ResetMaps() {

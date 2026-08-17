@@ -63,6 +63,36 @@ LLVMFuzzerCustomCrossOver(const uint8_t *Data1, size_t Size1,
                           const uint8_t *Data2, size_t Size2, uint8_t *Out,
                           size_t MaxOutSize, unsigned int Seed);
 
+// Optional user-provided post-execution effective-input callback.
+// Called after LLVMFuzzerTestOneInput returns 0 and before libFuzzer accounts
+// for features or corpus state. Data is the exact input just executed and Out
+// is separate runtime-owned storage. A non-zero return value is the effective
+// input size written to Out; zero uses Data as the effective input. Returning
+// more than MaxOutSize without writing past Out rejects this execution; this
+// lets the target report an effective input that does not fit the configured
+// maximum input length without terminating the fuzzing campaign. libFuzzer
+// warns on the first such rejection. When -max_len is not specified,
+// effective-input targets receive up to 4096 bytes of additional inferred
+// capacity without exceeding the default 1 MiB ceiling.
+//
+// The effective input drives feature sizing, corpus identity and storage, and
+// the next mutation in a mutation chain. Targets are responsible for
+// deterministic replay equivalence and idempotence, including
+// replay-equivalent sanitizer coverage from this callback itself. The callback
+// remains inside ordinary target timing, timeout, allocation, and
+// sanitizer-coverage accounting. A non-ASCII result is a fatal contract error
+// when libFuzzer runs with -only_ascii=1. Effective-input substitution is not
+// compatible with positional -data_flow_trace metadata.
+FUZZER_INTERFACE_VISIBILITY size_t LLVMFuzzerCustomGetEffectiveInput(
+    const uint8_t *Data, size_t Size, uint8_t *Out, size_t MaxOutSize);
+
+// Optional target marker requiring effective-input support.
+// A runtime that implements this extension calls the marker before
+// LLVMFuzzerInitialize and fails startup if LLVMFuzzerCustomGetEffectiveInput is
+// missing. Targets can use the call to make LLVMFuzzerInitialize reject an
+// unmodified runtime instead of silently falling back to identity behavior.
+FUZZER_INTERFACE_VISIBILITY void LLVMFuzzerRequireEffectiveInput(void);
+
 // Experimental, may go away in future.
 // libFuzzer-provided function to be used inside LLVMFuzzerCustomMutator.
 // Mutates raw data in [Data, Data+Size) inplace.

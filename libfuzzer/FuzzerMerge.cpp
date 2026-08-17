@@ -43,6 +43,7 @@ void Merger::ParseOrExit(std::istream &IS, bool ParseCoverage) {
 // file1
 // file2  # One file name per line.
 // STARTED 0 123  # FileID, file size
+// SIZE 0 100  # FileID, effective file size
 // FT 0 1 4 6 8  # FileID COV1 COV2 ...
 // COV 0 7 8 9 # FileID COV1 COV1
 // STARTED 1 456  # If FT is missing, the input crashed while processing.
@@ -73,11 +74,12 @@ bool Merger::Parse(std::istream &IS, bool ParseCoverage) {
     if (!std::getline(IS, Files[i].Name, '\n'))
       return false;
 
-  // Parse STARTED, FT, and COV lines.
+  // Parse STARTED, SIZE, FT, and COV lines.
   size_t ExpectedStartMarker = 0;
   const size_t kInvalidStartMarker = -1;
   size_t LastSeenStartMarker = kInvalidStartMarker;
   bool HaveFtMarker = true;
+  bool HaveSizeMarker = false;
   std::vector<uint32_t> TmpFeatures;
   std::set<uint32_t> PCs;
   while (std::getline(IS, Line, '\n')) {
@@ -95,6 +97,16 @@ bool Merger::Parse(std::istream &IS, bool ParseCoverage) {
       assert(ExpectedStartMarker < Files.size());
       ExpectedStartMarker++;
       HaveFtMarker = false;
+      HaveSizeMarker = false;
+    } else if (Marker == "SIZE") {
+      // SIZE FILE_ID EFFECTIVE_FILE_SIZE
+      size_t CurrentFileIdx = N;
+      if (CurrentFileIdx != LastSeenStartMarker ||
+          CurrentFileIdx >= Files.size() ||
+          !(ISS1 >> Files[CurrentFileIdx].Size))
+        return false;
+      Files[CurrentFileIdx].HasEffectiveSize = true;
+      HaveSizeMarker = true;
     } else if (Marker == "FT") {
       // FT FILE_ID COV1 COV2 COV3 ...
       size_t CurrentFileIdx = N;
@@ -112,9 +124,13 @@ bool Merger::Parse(std::istream &IS, bool ParseCoverage) {
       size_t CurrentFileIdx = N;
       if (CurrentFileIdx != LastSeenStartMarker)
         return false;
+      // Effective-size selection may reorder candidates.
+      const bool PreservePerFileCov =
+          HaveSizeMarker && CurrentFileIdx >= NumFilesInFirstCorpus;
       if (ParseCoverage)
         while (ISS1 >> N)
-          if (PCs.insert(N).second)
+          if ((PreservePerFileCov && !PCs.count(N)) ||
+              (!PreservePerFileCov && PCs.insert(N).second))
             Files[CurrentFileIdx].Cov.push_back(N);
     } else {
       return false;
@@ -140,8 +156,11 @@ size_t Merger::Merge(const std::set<uint32_t> &InitialFeatures,
                      std::set<uint32_t> *NewFeatures,
                      const std::set<uint32_t> &InitialCov,
                      std::set<uint32_t> *NewCov,
-                     std::vector<std::string> *NewFiles) {
+                     std::vector<std::string> *NewFiles,
+                     std::vector<size_t> *NewFileSizes) {
   NewFiles->clear();
+  if (NewFileSizes)
+    NewFileSizes->clear();
   NewFeatures->clear();
   NewCov->clear();
   assert(NumFilesInFirstCorpus <= Files.size());
@@ -184,11 +203,18 @@ size_t Merger::Merge(const std::set<uint32_t> &InitialFeatures,
         NewFeatures->insert(Fe);
       }
     }
-    if (FoundNewFeatures)
+    if (FoundNewFeatures) {
       NewFiles->push_back(Files[i].Name);
-    for (auto Cov : Files[i].Cov)
-      if (InitialCov.find(Cov) == InitialCov.end())
-        NewCov->insert(Cov);
+      if (NewFileSizes)
+        NewFileSizes->push_back(Files[i].Size);
+    }
+    // Candidates with effective sizes carry complete per-file PC sets because
+    // their effective-size ordering may differ from execution order. Attribute
+    // PCs only to candidates that the greedy merge actually selected.
+    if (FoundNewFeatures || !Files[i].HasEffectiveSize)
+      for (auto Cov : Files[i].Cov)
+        if (InitialCov.find(Cov) == InitialCov.end())
+          NewCov->insert(Cov);
   }
   return NewFeatures->size();
 }
@@ -223,6 +249,7 @@ void Fuzzer::CrashResistantMergeInternalStep(const std::string &CFPath,
     this->PrintStats(Where, "\n", 0, AllFeatures.size());
   };
   std::set<const TracePC::PCTableEntry *> AllPCs;
+  std::vector<const TracePC::PCTableEntry *> CurrentPCs;
   for (size_t i = M.FirstNotProcessedFile; i < M.Files.size(); i++) {
     Fuzzer::MaybeExitGracefully();
     auto U = FileToVector(M.Files[i].Name);
@@ -236,19 +263,30 @@ void Fuzzer::CrashResistantMergeInternalStep(const std::string &CFPath,
     OF.flush();  // Flush is important since Command::Execute may crash.
     // Run.
     TPC.ResetMaps();
-    ExecuteCallback(U.data(), U.size());
+    bool Accepted = ExecuteCallback(U.data(), U.size());
+    if (!Accepted && EF->LLVMFuzzerCustomGetEffectiveInput) {
+      OF << "FT " << i << "\n";
+      OF << "COV " << i << "\n";
+      OF.flush();
+      continue;
+    }
+    if (EF->LLVMFuzzerCustomGetEffectiveInput)
+      OF << "SIZE " << i << " " << EffectiveUnitSize << "\n";
     // Collect coverage. We are iterating over the files in this order:
     // * First, files in the initial corpus ordered by size, smallest first.
     // * Then, all other files, smallest first.
+    // Effective input sizes may change this order, so preserve complete
+    // feature sets and let the outer process select using those sizes.
     std::set<size_t> Features;
-    if (IsSetCoverMerge)
+    if (IsSetCoverMerge || EF->LLVMFuzzerCustomGetEffectiveInput)
       TPC.CollectFeatures([&](size_t Feature) { Features.insert(Feature); });
     else
       TPC.CollectFeatures([&](size_t Feature) {
         if (AllFeatures.insert(Feature).second)
           Features.insert(Feature);
       });
-    TPC.UpdateObservedPCs();
+    TPC.UpdateObservedPCs(EF->LLVMFuzzerCustomGetEffectiveInput ? &CurrentPCs
+                                                             : nullptr);
     // Show stats.
     if (!(TotalNumberOfRuns & (TotalNumberOfRuns - 1)))
       PrintStatsWrapper("pulse ");
@@ -260,10 +298,15 @@ void Fuzzer::CrashResistantMergeInternalStep(const std::string &CFPath,
       OF << " " << F;
     OF << "\n";
     OF << "COV " << i;
-    TPC.ForEachObservedPC([&](const TracePC::PCTableEntry *TE) {
+    auto WritePC = [&](const TracePC::PCTableEntry *TE) {
       if (AllPCs.insert(TE).second)
         OF << " " << TPC.PCTableEntryIdx(TE);
-    });
+    };
+    if (EF->LLVMFuzzerCustomGetEffectiveInput)
+      for (auto *TE : CurrentPCs)
+        OF << " " << TPC.PCTableEntryIdx(TE);
+    else
+      TPC.ForEachObservedPC(WritePC);
     OF << "\n";
     OF.flush();
   }
@@ -281,9 +324,12 @@ size_t Merger::SetCoverMerge(const std::set<uint32_t> &InitialFeatures,
                              std::set<uint32_t> *NewFeatures,
                              const std::set<uint32_t> &InitialCov,
                              std::set<uint32_t> *NewCov,
-                             std::vector<std::string> *NewFiles) {
+                             std::vector<std::string> *NewFiles,
+                             std::vector<size_t> *NewFileSizes) {
   assert(NumFilesInFirstCorpus <= Files.size());
   NewFiles->clear();
+  if (NewFileSizes)
+    NewFileSizes->clear();
   NewFeatures->clear();
   NewCov->clear();
   std::set<uint32_t> AllFeatures;
@@ -381,6 +427,8 @@ size_t Merger::SetCoverMerge(const std::set<uint32_t> &InitialFeatures,
     }
     // Add the index to this file to the result.
     NewFiles->push_back(MaxFeatureFile.Name);
+    if (NewFileSizes)
+      NewFileSizes->push_back(MaxFeatureFile.Size);
     // Update NewCov with the additional coverage
     // that MaxFeatureFile provides.
     for (const auto &C : MaxFeatureFile.Cov)
@@ -437,7 +485,13 @@ void CrashResistantMerge(const std::vector<std::string> &Args,
                          const std::set<uint32_t> &InitialCov,
                          std::set<uint32_t> *NewCov, const std::string &CFPath,
                          bool V, /*Verbose*/
-                         bool IsSetCoverMerge) {
+                         bool IsSetCoverMerge,
+                         std::vector<size_t> *NewFileSizes,
+                         std::map<std::string, size_t> *AllFileSizes) {
+  if (NewFileSizes)
+    NewFileSizes->clear();
+  if (AllFileSizes)
+    AllFileSizes->clear();
   if (NewCorpus.empty() && OldCorpus.empty()) return;  // Nothing to merge.
   size_t NumAttempts = 0;
   std::vector<MergeFileInfo> KnownFiles;
@@ -527,10 +581,15 @@ void CrashResistantMerge(const std::vector<std::string> &Args,
           M.ApproximateMemoryConsumption() >> 20, GetPeakRSSMb());
 
   M.Files.insert(M.Files.end(), KnownFiles.begin(), KnownFiles.end());
+  if (AllFileSizes)
+    for (const auto &File : M.Files)
+      (*AllFileSizes)[File.Name] = File.Size;
   if (IsSetCoverMerge)
-    M.SetCoverMerge(InitialFeatures, NewFeatures, InitialCov, NewCov, NewFiles);
+    M.SetCoverMerge(InitialFeatures, NewFeatures, InitialCov, NewCov, NewFiles,
+                    NewFileSizes);
   else
-    M.Merge(InitialFeatures, NewFeatures, InitialCov, NewCov, NewFiles);
+    M.Merge(InitialFeatures, NewFeatures, InitialCov, NewCov, NewFiles,
+            NewFileSizes);
   VPrintf(V, "MERGE-OUTER: %zd new files with %zd new features added; "
           "%zd new coverage edges\n",
          NewFiles->size(), NewFeatures->size(), NewCov->size());

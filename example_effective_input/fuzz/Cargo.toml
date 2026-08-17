@@ -1,0 +1,17 @@
+[package]
+name = "example_effective_input_fuzz"
+version = "0.1.0"
+edition = "2018"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = { path = "../.." }
+
+[[bin]]
+name = "effective_input_chain"
+path = "fuzz_targets/effective_input_chain.rs"
+test = false
+doc = false
+bench = false

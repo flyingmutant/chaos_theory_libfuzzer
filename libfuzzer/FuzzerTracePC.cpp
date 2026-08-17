@@ -160,9 +160,14 @@ ALWAYS_INLINE uintptr_t TracePC::GetNextInstructionPc(uintptr_t PC) {
 #endif
 }
 
-void TracePC::UpdateObservedPCs() {
+void TracePC::UpdateObservedPCs(
+    std::vector<const PCTableEntry *> *CurrentPCs) {
+  if (CurrentPCs)
+    CurrentPCs->clear();
   std::vector<uintptr_t> CoveredFuncs;
   auto ObservePC = [&](const PCTableEntry *TE) {
+    if (CurrentPCs)
+      CurrentPCs->push_back(TE);
     if (ObservedPCs.insert(TE).second && DoPrintNewPCs) {
       PrintPC("\tNEW_PC: %p %F %L", "\tNEW_PC: %p",
               GetNextInstructionPc(TE->PC));

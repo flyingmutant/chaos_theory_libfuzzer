@@ -42,4 +42,6 @@ cargo fuzz build  --dev
 (! cargo fuzz run --release bigbang -- -runs=10000000)
 popd
 
+bash ./example_effective_input/test.sh
+
 echo "All good!"

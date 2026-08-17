@@ -2,6 +2,35 @@
 
 Barebones wrapper around LLVM's libFuzzer runtime library.
 
+## Why this fork exists
+
+`chaos_theory` is unusual in that its `Source` is an immediate-mode API:
+data generation is intermixed with the execution of both property and SUT code.
+This allows for a very natural way to write complex property-based tests,
+without forcing people to come up with "complete test input" that they get
+at the start of the test and must manually parse/interpret during the test.
+
+Compared to traditional PBT/fuzzing libraries where property execution has shape
+`F(input) -> void`, in chaos_theory it is `F(suggested_input) -> effective_input`
+– or `F(input_tape) -> output_tape` in chaos_theory terminology; "tape" is a
+structural execution trace containing all pseudo-random decisions and their
+metadata. Structural mutation operates on the tape data only and thus can't
+guarantee that the next execution will be able to follow the mutated tape
+exactly. chaos_theory tries to match execution to the input tape and reuse it
+where possible, but in places of divergence falls back to fresh data generation
+– and records everything to the output tape.
+
+Stock libFuzzer attributes coverage to, mutates, and stores in corpus only the
+fuzz target input – which is not ideal, since input is only a suggested
+execution trace shape (sometimes even just a seed value), and we'd like to work
+with the actual realized execution trace (the output tape). This fork teaches
+libFuzzer to use the effective fuzz target input (provided via an optional callback)
+for corpus storage, feature accounting, and subsequent mutation. Targets not using
+the callback are unaffected. The new interface is documented in
+`libfuzzer/FuzzerInterface.h`.
+
+---
+
 The CPP parts are extracted from compiler-rt git repository with `git filter-branch`.
 
 libFuzzer relies on LLVM sanitizer support. The Rust compiler has built-in

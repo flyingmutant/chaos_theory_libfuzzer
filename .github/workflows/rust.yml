@@ -8,6 +8,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 2
     - name: Re-vendor libfuzzer
       run: ./update-libfuzzer.sh
     - name: Check that nothing changed

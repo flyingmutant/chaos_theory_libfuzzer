@@ -22,6 +22,8 @@
 //   and b) the last processed input. Then it starts processing the inputs one
 //   by one. Before processing every input it writes one line to control file:
 //   STARTED INPUT_ID INPUT_SIZE
+//   With an effective-input callback, it then writes:
+//   SIZE INPUT_ID EFFECTIVE_INPUT_SIZE
 //   After processing an input it writes the following lines:
 //   FT INPUT_ID Feature1 Feature2 Feature3 ...
 //   COV INPUT_ID Coverage1 Coverage2 Coverage3 ...
@@ -44,6 +46,7 @@
 #include "FuzzerIO.h"
 
 #include <istream>
+#include <map>
 #include <ostream>
 #include <set>
 #include <vector>
@@ -53,6 +56,7 @@ namespace fuzzer {
 struct MergeFileInfo {
   std::string Name;
   size_t Size = 0;
+  bool HasEffectiveSize = false;
   std::vector<uint32_t> Features, Cov;
 };
 
@@ -68,12 +72,14 @@ struct Merger {
   size_t Merge(const std::set<uint32_t> &InitialFeatures,
                std::set<uint32_t> *NewFeatures,
                const std::set<uint32_t> &InitialCov, std::set<uint32_t> *NewCov,
-               std::vector<std::string> *NewFiles);
+               std::vector<std::string> *NewFiles,
+               std::vector<size_t> *NewFileSizes = nullptr);
   size_t SetCoverMerge(const std::set<uint32_t> &InitialFeatures,
                        std::set<uint32_t> *NewFeatures,
                        const std::set<uint32_t> &InitialCov,
                        std::set<uint32_t> *NewCov,
-                       std::vector<std::string> *NewFiles);
+                       std::vector<std::string> *NewFiles,
+                       std::vector<size_t> *NewFileSizes = nullptr);
   size_t ApproximateMemoryConsumption() const;
   std::set<uint32_t> AllFeatures() const;
 };
@@ -86,7 +92,9 @@ void CrashResistantMerge(const std::vector<std::string> &Args,
                          std::set<uint32_t> *NewFeatures,
                          const std::set<uint32_t> &InitialCov,
                          std::set<uint32_t> *NewCov, const std::string &CFPath,
-                         bool Verbose, bool IsSetCoverMerge);
+                         bool Verbose, bool IsSetCoverMerge,
+                         std::vector<size_t> *NewFileSizes = nullptr,
+                         std::map<std::string, size_t> *AllFileSizes = nullptr);
 
 }  // namespace fuzzer
 
