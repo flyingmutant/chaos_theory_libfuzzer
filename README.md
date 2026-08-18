@@ -1,6 +1,7 @@
-# The `libfuzzer-sys` Crate
+# The `chaos_theory_libfuzzer` Crate
 
-Barebones wrapper around LLVM's libFuzzer runtime library.
+A fork of [`libfuzzer-sys`](https://crates.io/crates/libfuzzer-sys) with
+[`chaos_theory`](https://crates.io/crates/chaos_theory)-specific features.
 
 ## Why this fork exists
 
@@ -33,15 +34,25 @@ the callback are unaffected. The new interface is documented in
 
 The CPP parts are extracted from compiler-rt git repository with `git filter-branch`.
 
-libFuzzer relies on LLVM sanitizer support. The Rust compiler has built-in
-support for LLVM sanitizer support, for now, it's limited to Linux. As a result,
-`libfuzzer-sys` only works on Linux.
+libFuzzer relies on LLVM sanitizer coverage. Exact sanitizer and platform support
+depends on the Rust toolchain; `cargo fuzz` configures the appropriate instrumentation
+for supported targets.
 
 ## Usage
 
 ### Use `cargo fuzz`!
 
 [The recommended way to use this crate with `cargo fuzz`!][cargo-fuzz].
+Use a package alias so existing `libfuzzer_sys` imports and `cargo fuzz`'s
+generated target code continue to work:
+
+```toml
+[dependencies]
+libfuzzer-sys = {
+    package = "chaos_theory_libfuzzer",
+    version = "0.4.13"
+}
+```
 
 [cargo-fuzz]: https://github.com/rust-fuzz/cargo-fuzz
 
@@ -56,11 +67,14 @@ $ cargo new --bin fuzzed
 $ cd fuzzed
 ```
 
-Then add a dependency on the `fuzzer-sys` crate and your own crate:
+Then add this crate under the `libfuzzer-sys` alias and add your own crate:
 
 ```toml
 [dependencies]
-libfuzzer-sys = "0.4.0"
+libfuzzer-sys = {
+    package = "chaos_theory_libfuzzer",
+    version = "0.4.13"
+}
 your_crate = { path = "../path/to/your/crate" }
 ```
 
@@ -112,16 +126,24 @@ Alternatively, you may also disable the default `link_libfuzzer` feature:
 In `Cargo.toml`:
 ```toml
 [dependencies]
-libfuzzer-sys = { default-features = false }
+libfuzzer-sys = {
+    package = "chaos_theory_libfuzzer",
+    version = "0.4.13",
+    default-features = false
+}
 ```
 
 Then link to your own runtime in your `build.rs`.
 
 ## Updating libfuzzer from upstream
 
-* Update the `COMMIT=...` variable in `./update-libfuzzer.sh` with the new
-  commit hash from [llvm/llvm-project](https://github.com/llvm/llvm-project)
-  that you are vendoring.
+* After rebasing this fork onto a newer
+  [`rust-fuzz/libfuzzer`](https://github.com/rust-fuzz/libfuzzer) commit, update
+  the `UPSTREAM_COMMIT=...` variable in `./update-libfuzzer.sh` to that commit.
+
+* To vendor libFuzzer from a different
+  [`llvm/llvm-project`](https://github.com/llvm/llvm-project) commit, update the
+  `LLVM_COMMIT=...` variable.
 
 * Re-run the script:
 

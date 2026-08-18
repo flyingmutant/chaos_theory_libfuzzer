@@ -8,7 +8,7 @@ edition = "2018"
 cargo-fuzz = true
 
 [dependencies]
-libfuzzer-sys = { path = "../..", features = ["arbitrary-derive"] }
+libfuzzer-sys = { package = "chaos_theory_libfuzzer", path = "../..", features = ["arbitrary-derive"] }
 example_arbitrary = { path = ".." }
 
 [[bin]]

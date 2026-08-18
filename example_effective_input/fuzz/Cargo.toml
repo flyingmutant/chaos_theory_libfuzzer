@@ -7,7 +7,7 @@ edition = "2018"
 cargo-fuzz = true
 
 [dependencies]
-libfuzzer-sys = { path = "../.." }
+libfuzzer-sys = { package = "chaos_theory_libfuzzer", path = "../.." }
 
 [[bin]]
 name = "effective_input_chain"

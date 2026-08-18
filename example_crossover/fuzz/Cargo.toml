@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 rand = { version = "0.10", default-features = false }
-libfuzzer-sys = { path = "../.." }
+libfuzzer-sys = { package = "chaos_theory_libfuzzer", path = "../.." }
 example_crossover = { path = ".." }
 
 [[bin]]

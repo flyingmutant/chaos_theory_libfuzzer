@@ -1,11 +1,14 @@
 [package]
-authors = ["The rust-fuzz Project Developers"]
-description = "A wrapper around LLVM's libFuzzer runtime."
+authors = [
+    "The rust-fuzz Project Developers",
+    "Gregory Petrosyan <pgregory@pgregory.net>",
+]
+description = "A fork of libfuzzer-sys with chaos_theory-specific features."
 edition = "2018"
 license = "(MIT OR Apache-2.0) AND NCSA"
-name = "libfuzzer-sys"
+name = "chaos_theory_libfuzzer"
 readme = "./README.md"
-repository = "https://github.com/rust-fuzz/libfuzzer"
+repository = "https://github.com/flyingmutant/chaos_theory_libfuzzer"
 version = "0.4.13"
 exclude = [
     ".github",
@@ -18,6 +21,9 @@ exclude = [
     "rust-toolchain", # downstream crates will ignore it anyway
     "update-libfuzzer.sh", # there is no need for downstream crates to execute this script
 ]
+
+[lib]
+name = "libfuzzer_sys"
 
 [dependencies]
 arbitrary = "1"
